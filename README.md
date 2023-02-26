@@ -2,4 +2,4 @@
 
 Autosplitter for Sonic 2 Absolute with customizable options
 
-<img src="https://raw.githubusercontent.com/SonicSpeedrunning/LiveSplit.Sonic2Absolute_/master/settings.png">
+<img src="https://raw.githubusercontent.com/SonicSpeedrunning/LiveSplit.Sonic2Absolute_wasm/master/settings.png">
