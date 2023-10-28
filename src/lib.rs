@@ -1,54 +1,75 @@
 #![no_std]
-use asr::{signature::Signature, timer, timer::TimerState, watcher::Watcher, Address, Process};
+#![feature(type_alias_impl_trait, const_async_blocks)]
+#![warn(
+    clippy::complexity,
+    clippy::correctness,
+    clippy::perf,
+    clippy::style,
+    clippy::undocumented_unsafe_blocks,
+    rust_2018_idioms
+)]
 
-#[cfg(all(not(test), target_arch = "wasm32"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
+use asr::{
+    file_format::pe,
+    future::{next_tick, retry},
+    settings::Gui,
+    signature::Signature,
+    timer::{self, TimerState},
+    watcher::Watcher,
+    Address, Address32, Process,
+};
+
+asr::panic_handler!();
+asr::async_main!(nightly);
+
+const PROCESS_NAMES: [&str; 1] = ["Sonic2Absolute.exe"];
+
+async fn main() {
+    let mut settings = Settings::register();
+
+    loop {
+        // Hook to the target process
+        let process = retry(|| PROCESS_NAMES.iter().find_map(|&name| Process::attach(name))).await;
+
+        process
+            .until_closes(async {
+                // Once the target has been found and attached to, set up some default watchers
+                let mut watchers = Watchers::default();
+
+                // Perform memory scanning to look for the addresses we need
+                let addresses = Addresses::init(&process).await;
+
+                loop {
+                    // Splitting logic. Adapted from OG LiveSplit:
+                    // Order of execution
+                    // 1. update() will always be run first. There are no conditions on the execution of this action.
+                    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                    // 3. If reset does not return true, then the split action will be run.
+                    // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                    settings.update();
+                    update_loop(&process, &addresses, &mut watchers);
+
+                    let timer_state = timer::state();
+                    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                        if reset(&watchers, &settings) {
+                            timer::reset()
+                        } else if split(&watchers, &settings) {
+                            timer::split()
+                        }
+                    }
+
+                    if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
+                        timer::start();
+                    }
+
+                    next_tick().await;
+                }
+            })
+            .await;
+    }
 }
 
-static AUTOSPLITTER: spinning_top::Spinlock<State> = spinning_top::const_spinlock(State {
-    game: None,
-    watchers: Watchers {
-        state: Watcher::new(),
-        levelid: Watcher::new(),
-        startindicator: Watcher::new(),
-        zoneselectongamecomplete: Watcher::new(),
-        zoneindicator: Watcher::new(),
-    },
-    settings: None,
-});
-
-struct State {
-    game: Option<ProcessInfo>,
-    watchers: Watchers,
-    settings: Option<Settings>,
-}
-
-struct ProcessInfo {
-    game: Process,
-    main_module_base: Address,
-    main_module_size: u64,
-    addresses: Option<MemoryPtr>,
-}
-
-struct Watchers {
-    state: Watcher<u8>,
-    levelid: Watcher<Acts>,
-    startindicator: Watcher<u8>,
-    zoneselectongamecomplete: Watcher<u8>,
-    zoneindicator: Watcher<ZoneIndicator>,
-}
-
-struct MemoryPtr {
-    state: Address,
-    levelid: Address,
-    startindicator: Address,
-    zoneselectongamecomplete: Address,
-    zoneindicator: Address,
-}
-
-#[derive(asr::Settings)]
+#[derive(asr::settings::Gui)]
 struct Settings {
     #[default = true]
     /// Start --> New Game
@@ -121,183 +142,154 @@ struct Settings {
     death_egg: bool,
 }
 
-impl State {
-    fn attach_process() -> Option<ProcessInfo> {
-        const PROCESS_NAMES: [&str; 1] = ["Sonic2Absolute.exe"];
-        let mut proc: Option<Process> = None;
-        let mut proc_name: Option<&str> = None;
-
-        for name in PROCESS_NAMES {
-            proc = Process::attach(name);
-            if proc.is_some() {
-                proc_name = Some(name);
-                break;
-            }
-        }
-    
-        let game = proc?;
-        let main_module_base = game.get_module_address(proc_name?).ok()?;
-        let main_module_size: u64 = game.get_module_size(proc_name?).ok()?;
-        let addresses = MemoryPtr::new(&game, main_module_base, main_module_size);
-
-        Some(ProcessInfo {
-            game,
-            main_module_base,
-            main_module_size,
-            addresses,
-        })
-    }
-
-    fn update(&mut self) {
-        self.settings.get_or_insert_with(Settings::register);
-        
-        // Checks is LiveSplit is currently attached to a target process and runs attach_process() otherwise
-        if self.game.is_none() {
-            self.game = State::attach_process()
-        }
-        let Some(game) = &mut self.game else { return };
-
-        if !game.game.is_open() {
-            self.game = None;
-            return;
-        }
-
-        // Get memory addresses
-        let Some(addresses) = &game.addresses else { game.addresses = MemoryPtr::new(&game.game, game.main_module_base, game.main_module_size); return; };
-
-        // Update the watchers variables
-        let game = &game.game;
-        update_internal(game, addresses, &mut self.watchers);
-
-        let timer_state = timer::state();
-        if timer_state == TimerState::Running || timer_state == TimerState::Paused {
-        /*
-            if is_loading(self) {
-                timer::pause_game_time()
-            } else {
-                timer::resume_game_time()
-            }
-        */
-
-        //  timer::set_game_time(game_time());
-            if reset(self) {
-                timer::reset()
-            } else if split(self) {
-                timer::split()
-            }
-            
-        } 
-
-        if timer_state == TimerState::NotRunning {
-            if start(self) {
-                timer::start();
-            }
-        }     
-    }    
+#[derive(Default)]
+struct Watchers {
+    state: Watcher<u8>,
+    levelid: Watcher<Acts>,
+    startindicator: Watcher<u8>,
+    zoneselectongamecomplete: Watcher<u8>,
+    zoneindicator: Watcher<ZoneIndicator>,
 }
 
-impl MemoryPtr {
-    fn new(process: &Process, addr: Address, size: u64) -> Option<Self> {
-        fn pointerpath(process: &Process, ptr: Address, offset1: u32, offset2: u32, offset3: u32) -> Option<Address> {
-            let result = process.read_pointer_path32::<u32>(ptr.0 as u32, &[offset1, offset2]).ok()?;
-            Some(Address(result as u64 + offset3 as u64))
-        }
+struct Addresses {
+    state: Address,
+    levelid: Address,
+    startindicator: Address,
+    zoneselectongamecomplete: Address,
+    zoneindicator: Address,
+}
 
-        const SIG: Signature<19> = Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
-        let ptr = SIG.scan_process_range(process, addr, size)?.0 + 14;
-        let ptr = Address(process.read::<u32>(Address(ptr)).ok()? as u64);
-        let state = pointerpath(process, ptr, 0x4 * 89, 8, 0x9D8)?;
-        let levelid = pointerpath(process, ptr, 0x4 * 123, 1, 0)?;
-        let startindicator = pointerpath(process, ptr, 0x4 * 30, 8, 0x9D8)?;
-        let zoneselectongamecomplete = pointerpath(process, ptr, 0x4  * 91, 8, 0x9D8)?;
-        
-        const SIG2: Signature<11> = Signature::new("69 F8 ???????? B8 ????????");
-        let ptr = SIG2.scan_process_range(process, addr, size)?.0 + 7;
-        let zoneindicator = Address(process.read::<u32>(Address(ptr)).ok()? as u64);
+impl Addresses {
+    async fn init(process: &Process) -> Self {
+        let main_module_base = retry(|| {
+            PROCESS_NAMES
+                .iter()
+                .find_map(|&name| process.get_module_address(name).ok())
+        })
+        .await;
+        let main_module_size =
+            retry(|| pe::read_size_of_image(process, main_module_base)).await as u64;
+        let main_module = (main_module_base, main_module_size);
 
+        let pointer_path = |ptr, offset1, offset2, offset3| async move {
+            let result = retry(|| {
+                process
+                    .read_pointer_path32::<Address32>(ptr, &[offset1, offset2])
+                    .ok()
+            })
+            .await;
+            core::convert::Into::<Address>::into(result) + offset3
+        };
 
-        Some(Self {
+        let ptr = {
+            const SIG: Signature<19> =
+                Signature::new("3D ???????? 0F 87 ???????? FF 24 85 ???????? A1");
+            let ptr = retry(|| SIG.scan_process_range(process, main_module)).await + 14;
+            retry(|| process.read::<Address32>(ptr).ok()).await
+        };
+
+        let state = pointer_path(ptr, 0x4 * 89, 8, 0x9D8).await;
+        let levelid = pointer_path(ptr, 0x4 * 123, 1, 0).await;
+        let startindicator = pointer_path(ptr, 0x4 * 30, 8, 0x9D8).await;
+        let zoneselectongamecomplete = pointer_path(ptr, 0x4 * 91, 8, 0x9D8).await;
+
+        let ptr = {
+            const SIG2: Signature<11> = Signature::new("69 F8 ?? ?? ?? ?? B8 ?? ?? ?? ??");
+            retry(|| SIG2.scan_process_range(process, main_module)).await + 7
+        };
+        let zoneindicator: Address = retry(|| process.read::<Address32>(ptr).ok()).await.into();
+
+        Self {
             state,
             levelid,
             startindicator,
             zoneselectongamecomplete,
             zoneindicator,
-        })
+        }
     }
 }
 
-#[no_mangle]
-pub extern "C" fn update() {
-    AUTOSPLITTER.lock().update();
-}
+fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
+    watchers
+        .state
+        .update_infallible(game.read(addresses.state).unwrap_or_default());
+    watchers
+        .startindicator
+        .update_infallible(game.read(addresses.startindicator).unwrap_or_default());
+    watchers.zoneselectongamecomplete.update_infallible(
+        game.read(addresses.zoneselectongamecomplete)
+            .unwrap_or_default(),
+    );
 
-fn update_internal(game: &Process, addresses: &MemoryPtr, watchers: &mut Watchers) {
-    let Some(_thing) = watchers.state.update(game.read(addresses.state).ok()) else { return };
-    let Some(_thing) = watchers.startindicator.update(game.read(addresses.startindicator).ok()) else { return };
-    let Some(_thing) = watchers.zoneselectongamecomplete.update(game.read(addresses.zoneselectongamecomplete).ok()) else { return };
+    let zone = watchers.zoneindicator.update_infallible({
+        match game.read::<u32>(addresses.zoneindicator) {
+            Ok(0x6E69614D) => ZoneIndicator::MainMenu,
+            Ok(0x656E6F5A) => ZoneIndicator::Zones,
+            Ok(0x69646E45) => ZoneIndicator::Ending,
+            Ok(0x65766153) => ZoneIndicator::SaveSelect,
+            _ => ZoneIndicator::Default,
+        }
+    });
 
-    let Some(g) = game.read::<u32>(addresses.zoneindicator).ok() else { return };
-    let i: ZoneIndicator = match &g {
-        0x6E69614D => ZoneIndicator::MainMenu,
-        0x656E6F5A => ZoneIndicator::Zones,
-        0x69646E45 => ZoneIndicator::Ending,
-        0x65766153 => ZoneIndicator::SaveSelect,
-        _ => ZoneIndicator::Default
-    };
-    let Some(zone) = watchers.zoneindicator.update(Some(i)) else { return };
-
-    if zone.current == ZoneIndicator::Ending {
-        watchers.levelid.update(Some(Acts::Default));
-    } else if zone.current == ZoneIndicator::Zones {
-        let Some(g) = game.read::<u8>(addresses.levelid).ok() else { return };
-        let i: Acts = match g {
-            0 => Acts::EmeraldHill1,
-            1 => Acts::EmeraldHill2,
-            2 => Acts::ChemicalPlant1,
-            3 => Acts::ChemicalPlant2,
-            4 => Acts::AquaticRuin1,
-            5 => Acts::AquaticRuin2,
-            6 => Acts::CasinoNight1,
-            7 => Acts::CasinoNight2,
-            8 => Acts::HillTop1,
-            9 => Acts::HillTop2,
-            10 => Acts::MysticCave1,
-            11 => Acts::MysticCave2,
-            12 => Acts::OilOcean1,
-            13 => Acts::OilOcean2,
-            14 => Acts::Metropolis1,
-            15 => Acts::Metropolis2,
-            16 => Acts::Metropolis3,
-            17 => Acts::SkyChase,
-            18 => Acts::WingFortress,
-            19 => Acts::DeathEgg,
+    watchers.levelid.update_infallible(match zone.current {
+        ZoneIndicator::Ending => Acts::Default,
+        ZoneIndicator::Zones => match game.read::<u8>(addresses.levelid) {
+            Ok(0) => Acts::EmeraldHill1,
+            Ok(1) => Acts::EmeraldHill2,
+            Ok(2) => Acts::ChemicalPlant1,
+            Ok(3) => Acts::ChemicalPlant2,
+            Ok(4) => Acts::AquaticRuin1,
+            Ok(5) => Acts::AquaticRuin2,
+            Ok(6) => Acts::CasinoNight1,
+            Ok(7) => Acts::CasinoNight2,
+            Ok(8) => Acts::HillTop1,
+            Ok(9) => Acts::HillTop2,
+            Ok(10) => Acts::MysticCave1,
+            Ok(11) => Acts::MysticCave2,
+            Ok(12) => Acts::OilOcean1,
+            Ok(13) => Acts::OilOcean2,
+            Ok(14) => Acts::Metropolis1,
+            Ok(15) => Acts::Metropolis2,
+            Ok(16) => Acts::Metropolis3,
+            Ok(17) => Acts::SkyChase,
+            Ok(18) => Acts::WingFortress,
+            Ok(19) => Acts::DeathEgg,
             _ => Acts::Default,
-        };
-        watchers.levelid.update(Some(i));
-    } else {
-        let Some(x) = &watchers.levelid.pair else { return };
-        let x = x.current;
-        watchers.levelid.update(Some(x));
-    }
+        },
+        _ => match &watchers.levelid.pair {
+            Some(x) => x.current,
+            _ => Acts::Default,
+        },
+    });
 }
 
-fn start(state: &State) -> bool {
-    let Some(settings) = &state.settings else { return false };
-
-    let Some(state2) = &state.watchers.state.pair else { return false };
-    let Some(startindicator) = &state.watchers.startindicator.pair else { return false };
-    let Some(zoneselectongamecomplete) = &state.watchers.zoneselectongamecomplete.pair else { return false };
+fn start(watchers: &Watchers, settings: &Settings) -> bool {
+    let Some(state2) = &watchers.state.pair else {
+        return false;
+    };
+    let Some(startindicator) = &watchers.startindicator.pair else {
+        return false;
+    };
+    let Some(zoneselectongamecomplete) = &watchers.zoneselectongamecomplete.pair else {
+        return false;
+    };
 
     let runstartedsavefile = state2.old == 5 && state2.current == 7;
-    let ronstartednosavefile = state2.current == 4 && startindicator.changed() && startindicator.current == 1;
-    let runstartedngp = state2.current == 6 && startindicator.changed() && startindicator.current == 1 && zoneselectongamecomplete.current == 0;
+    let ronstartednosavefile =
+        state2.current == 4 && startindicator.changed() && startindicator.current == 1;
+    let runstartedngp = state2.current == 6
+        && startindicator.changed()
+        && startindicator.current == 1
+        && zoneselectongamecomplete.current == 0;
 
-    (settings.start_clean_save && (runstartedsavefile || ronstartednosavefile)) || (settings.start_new_game_plus && runstartedngp)
+    (settings.start_clean_save && (runstartedsavefile || ronstartednosavefile))
+        || (settings.start_new_game_plus && runstartedngp)
 }
 
-fn split(state: &State) -> bool {
-    let Some(levelid) = &state.watchers.levelid.pair else { return false };
-    let Some(settings) = &state.settings else { return false };
+fn split(watchers: &Watchers, settings: &Settings) -> bool {
+    let Some(levelid) = &watchers.levelid.pair else {
+        return false;
+    };
 
     match levelid.current {
         Acts::EmeraldHill2 => settings.emerald_hill_1 && levelid.old == Acts::EmeraldHill1,
@@ -324,17 +316,12 @@ fn split(state: &State) -> bool {
     }
 }
 
-fn reset(state: &State) -> bool {
-    let Some(settings) = &state.settings else { return false };
-    let Some(state2) = &state.watchers.state.pair else { return false };
+fn reset(watchers: &Watchers, settings: &Settings) -> bool {
+    let Some(state2) = &watchers.state.pair else {
+        return false;
+    };
     settings.reset && state2.old == 0 && (state2.current == 4 || state2.current == 5)
 }
-
-/*
-    fn is_loading(state: &State) -> bool {
-        false
-    }
-*/
 
 #[derive(Clone, Copy, PartialEq)]
 enum ZoneIndicator {
